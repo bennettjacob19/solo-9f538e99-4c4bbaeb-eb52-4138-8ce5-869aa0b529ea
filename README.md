@@ -39,7 +39,8 @@ docker compose up --build
    * **人工延迟**：对每个进程的 `prepare/gradient/commit` 响应加 0～120 秒延迟；
    * **强杀 worker1/worker2（SIGKILL）**：容器入口守护自动重启该进程。
 5. 进程退出后整组自动 **paused**；点 **故障后恢复（Resume）** 继续。
-6. **下载已确认权重**：只对应最后已确认轮（`weights_latest.json`）。
+6. **下载已确认权重**：永远只对应最后已确认轮（`weights_latest.json`；若该派生
+   文件缺失或落后，接口会依据 `status.json` 现场重建）。
 
 ## 4. 容错与一致性协议（为什么恢复后数值一致）
 
@@ -50,12 +51,23 @@ docker compose up --build
 `commit`。worker 在返回前用 **temp+fsync+原子 rename** 落盘新的 `w/v/round`。
 
 ### 4.2 确认规则（不跳轮、不重复应用）
-* 只有**两侧同一轮、同代的参数与动量都完整持久化**后，协调者才原子写入
-  `status.json` 确认该轮；确认前页面与权重都不会前进。
-* 允许重做未确认轮；worker 的 `commit` 对已持久化轮幂等（返回 `dedup=true`，
-  不二次应用），且拒绝非 `当前轮+1` 的提交，因此无法跳轮。
-* 协调者自身在轮中被杀：重启 lifespan 把 `running` 改为 `paused`，未确认轮作废，
-  下次 Resume 经 `/prepare` 把两侧回滚到最后确认轮后重做。
+* **`status.json` 是唯一的确认记录**：它同时保存 `confirmed_round`、与该轮对应的
+  `w`/`v` 以及损失历史。只有它被原子替换成功，这一轮才“公布”给网页、损失历史与
+  权重下载；写入失败时三者都仍停在**上一已确认轮**。（轮中出现的 `running`/
+  `preparing`、`running_round`、事件文本只是内存中的进度提示，重启即丢，绝不写入
+  确认字段。）
+* 协调者在**内存里绝不先行推进**确认字段：`progress()` 只改 UI 字段，成功后也只
+  调整由 `status.json` 派生的权重工件。
+* worker 的 `commit` 在**落盘成功后才应答**；协调者在两侧应答都匹配后，才用一次
+  原子写提交 `status.json`。写失败 → 整组暂停，内存与磁盘都仍是上一确认轮。
+* 允许重做未确认轮；`commit` 对已持久化轮幂等（返回 `dedup=true`，不二次应用），
+  且拒绝非 `当前轮+1` 的提交，因此无法跳轮。
+* 协调者自身在轮中被杀：重启 lifespan 把 `running/preparing` 改为 `paused`，并把
+  任何超出 `confirmed_round` 的损失点丢弃；下次 Resume 经 `/prepare` 把两侧回滚到
+  最后确认轮后重做。
+* 权重工件（`weights_round_XXXX.json` / `weights_latest.json`）是**派生品**：正常
+  在确认后写入；若该写入失败，下载接口会依据 `status.json` 现场重建，因此下载
+  永远不会超前于已确认轮。
 
 ### 4.3 代际围栏（旧组迟到消息不能推进新组）
 每条协议消息都带 `task_id + gen`。每次开始/恢复 `gen` 严格 +1，worker 只服务
@@ -64,8 +76,10 @@ docker compose up --build
 ### 4.4 持久化与权重
 * 所有 JSON 均原子写（临时文件 → fsync → `os.replace` → 目录 fsync），读者只会
   看到上一完整版本或新版本，不会看到半写文件。
-* 权重每轮先写不可变文件 `weights_round_XXXX.json`，最后原子切换 `weights_latest.json`；
-  保存失败时上一完整轮工件保持不变，下载内容永远只对应已确认轮。
+* 每轮的唯一提交点是 `status.json` 的原子替换；只有成功后才去写权重工件。
+  权重每轮先写不可变文件 `weights_round_XXXX.json`，最后原子切换 `weights_latest.json`；
+  即便该派生写入失败，下载接口也会从已确认的 `status.json` 重建，因此下载内容永远
+  只对应已确认轮。
 
 ## 5. 故障演练
 
@@ -95,7 +109,9 @@ python -m pytest tests/ -q
 * `tests/test_lrmath.py`：分片残差重建梯度与单进程梯度逐位相等、可重复、数值稳定。
 * `tests/test_integration.py`：拉起 3 个真实 uvicorn 进程，覆盖
   干净训练一致、worker 强杀恢复、协调者轮中重启、全集群重启、旧代消息围栏、
-  commit 幂等去重、`/prepare` 回滚、CSV 校验、仅确认轮可下载权重。
+  commit 幂等去重、`/prepare` 回滚、CSV 校验、仅确认轮可下载权重，以及
+  **确认写盘失败**（`STORAGE_FAULT_FILE` 注入）：网页/损失/下载冻结在上一确认轮、
+  Resume 回滚并重做、协调者重启不跳轮，和**权重导出失败**后下载仍只对应确认轮。
 
 ## 7. 目录结构
 

@@ -95,7 +95,13 @@ class Service:
 
 
 @pytest.fixture()
-def cluster(tmp_path):
+def coord_env(tmp_path):
+    """Extra environment for the coordinator process (tests override this)."""
+    return {}
+
+
+@pytest.fixture()
+def cluster(tmp_path, coord_env):
     p1, p2, pc = _free_port(), _free_port(), _free_port()
     d1, d2, dc = (tmp_path / "w1"), (tmp_path / "w2"), (tmp_path / "coord")
     for d in (d1, d2, dc):
@@ -108,6 +114,7 @@ def cluster(tmp_path):
         "COORD_DATA": str(dc),
         "WORKER1_URL": f"http://127.0.0.1:{p1}",
         "WORKER2_URL": f"http://127.0.0.1:{p2}",
+        **coord_env,
     }, health_path="/api/status")
     w1.start(); w2.start(); coord.start()
     yield {
@@ -371,9 +378,9 @@ def test_worker_commit_dedup_and_prepare_rollback(cluster, tmp_path):
     h = httpx.get(url + "/health", timeout=5).json()
     at = h["round"]
     # Gradient for the next round.
-    g = httpx.post(url + "/gradient",
-                   json={"task_id": task_id, "gen": gen, "round": at + 1},
-                   timeout=5).json()
+    httpx.post(url + "/gradient",
+               json={"task_id": task_id, "gen": gen, "round": at + 1},
+               timeout=5).raise_for_status()
     grad = [0.01, -0.02, 0.03]
     c1 = httpx.post(url + "/commit",
                     json={"task_id": task_id, "gen": gen,
@@ -416,4 +423,272 @@ def test_delay_endpoint_survives_and_rounds_still_exact(cluster, tmp_path):
     st = _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
     ref = httpx.get(base + "/api/reference", timeout=10).json()
     for k, point in enumerate(st["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+
+
+# ------------------------------------------------- durability fault injection
+def _arm_fault(path: Path, match: str, count: int = 1, skip: int = 0,
+               contains: str | None = None) -> None:
+    spec = {"match": match, "count": count, "skip": skip}
+    if contains is not None:
+        spec["contains"] = contains
+    path.write_text(json.dumps(spec), encoding="utf-8")
+
+
+def _assert_confirmed_view(base, cdir: Path, confirmed: int, total: int):
+    """Web, loss history, durable status and download all describe ``confirmed``."""
+    st = httpx.get(base + "/api/status", timeout=5).json()
+    assert st["confirmed_round"] == confirmed
+    assert [p["round"] for p in st["loss_history"]] == list(range(confirmed + 1))
+    disk = json.loads((cdir / "status.json").read_text())
+    assert disk["confirmed_round"] == confirmed
+    assert [p["round"] for p in disk["loss_history"]] == list(
+        range(confirmed + 1))
+    wdoc = httpx.get(base + "/api/weights", timeout=10).json()
+    assert wdoc["confirmed_round"] == confirmed
+    assert wdoc["weights"]["bias"] == st["w"][0]
+    assert wdoc["weights"]["w1"] == st["w"][1]
+    assert wdoc["weights"]["w2"] == st["w"][2]
+    return st
+
+
+@pytest.fixture()
+def fault_cluster(tmp_path, coord_env):
+    """Cluster whose coordinator has an armed storage-fault marker file."""
+    marker = tmp_path / "fault.json"
+    coord_env["STORAGE_FAULT_FILE"] = str(marker)
+    # Reuse the standard fixture machinery with the extra env.
+    p1, p2, pc = _free_port(), _free_port(), _free_port()
+    d1, d2, dc = (tmp_path / "w1"), (tmp_path / "w2"), (tmp_path / "coord")
+    for d in (d1, d2, dc):
+        d.mkdir()
+    w1 = Service("worker1", "worker", p1,
+                 {"WORKER_ID": "worker1", "WORKER_DATA": str(d1)})
+    w2 = Service("worker2", "worker", p2,
+                 {"WORKER_ID": "worker2", "WORKER_DATA": str(d2)})
+    coord = Service("coordinator", "coordinator", pc, {
+        "COORD_DATA": str(dc),
+        "WORKER1_URL": f"http://127.0.0.1:{p1}",
+        "WORKER2_URL": f"http://127.0.0.1:{p2}",
+        **coord_env,
+    }, health_path="/api/status")
+    w1.start(); w2.start(); coord.start()
+    yield {
+        "coord": f"http://127.0.0.1:{pc}",
+        "coord_svc": coord, "w1": w1, "w2": w2,
+        "paths": {"w1": d1, "w2": d2, "coord": dc},
+        "marker": marker,
+    }
+    for s in (w1, w2, coord):
+        s.stop()
+
+
+def _pause_now(base: str, timeout: float = 20) -> dict:
+    """Pause deterministically; returns the paused status document."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = httpx.post(base + "/api/pause", timeout=5)
+        if r.status_code == 200:
+            break
+        st = httpx.get(base + "/api/status", timeout=5).json()
+        if st["status"] not in ("running", "preparing"):
+            break
+        time.sleep(0.1)
+    return _wait_status(base, lambda d: d["status"] in ("paused", "completed"),
+                        timeout=timeout)
+
+
+def test_status_write_failure_freezes_web_loss_and_download(
+        fault_cluster, tmp_path):
+    """The reported chain: workers applied round k, the confirmation write
+    fails. Until a write succeeds, web/loss/download must all stay at k-1;
+    resume must realign both workers and redo the unconfirmed round exactly."""
+    base = fault_cluster["coord"]
+    cdir = fault_cluster["paths"]["coord"]
+    rounds = 14
+    # Slow enough that a paused round is a clean between-rounds boundary.
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.05}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=rounds)
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    st = _pause_now(base)
+    before = st["confirmed_round"]
+    assert 3 <= before < rounds
+    # Pause commits the confirmed state; make sure it is on disk cleanly.
+    _assert_confirmed_view(base, cdir, before, rounds)
+
+    # Fail exactly the confirmation write for the next round. The payload is
+    # compact JSON with sorted keys, so this substring only matches a status
+    # document whose confirmed_round is ``before + 1``.
+    _arm_fault(fault_cluster["marker"], "status.json",
+               contains=f'"confirmed_round":{before + 1},')
+
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+
+    st = _wait_status(base, lambda d: d["status"] == "paused", timeout=40)
+    confirmed = st["confirmed_round"]
+    # The web, loss history, durable status and download are frozen together
+    # at the last round whose confirmation actually landed.
+    assert confirmed in (before, before + 1)
+    st = _assert_confirmed_view(base, cdir, confirmed, rounds)
+    assert st["last_error"]
+    # At least one side may already have applied the unconfirmed round; that
+    # advance must be invisible and must be rolled back, not confirmed.
+    for w in ("w1", "w2"):
+        h = httpx.get(
+            f"http://127.0.0.1:{fault_cluster[w].port}/health",
+            timeout=5).json()
+        assert h["round"] <= confirmed + 1
+
+    # A retried save (Resume) must roll both workers back to ``confirmed``,
+    # redo the round and match uninterrupted training bit for bit.
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+    final = _wait_status(base, lambda d: d["status"] == "completed",
+                         timeout=90)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    assert final["confirmed_round"] == rounds
+    assert [p["round"] for p in final["loss_history"]] == list(
+        range(rounds + 1))                              # no duplicate entries
+    for k, point in enumerate(final["loss_history"]):
+        assert point["loss"] == ref["loss"][k], f"round {k} differs"
+    np.testing.assert_array_equal(np.asarray(final["w"]),
+                                  np.asarray(ref["weights"][-1]))
+    np.testing.assert_array_equal(np.asarray(final["v"]),
+                                  np.asarray(ref["momentum"][-1]))
+    _assert_confirmed_view(base, cdir, rounds, rounds)
+
+
+def test_status_write_failure_then_coordinator_restart_does_not_skip(
+        fault_cluster, tmp_path):
+    """Repeat the failure and reboot the coordinator before resuming: the
+    durable record must still be the last confirmed round, and the recovered
+    run must equal uninterrupted training."""
+    base = fault_cluster["coord"]
+    cdir = fault_cluster["paths"]["coord"]
+    rounds = 12
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.05}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=rounds)
+    _wait_status(base, lambda d: d["confirmed_round"] >= 3)
+    st = _pause_now(base)
+    before = st["confirmed_round"]
+    _arm_fault(fault_cluster["marker"], "status.json",
+               contains=f'"confirmed_round":{before + 1},')
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+    st = _wait_status(base, lambda d: d["status"] == "paused", timeout=40)
+    confirmed = st["confirmed_round"]
+    assert confirmed in (before, before + 1)
+    _assert_confirmed_view(base, cdir, confirmed, rounds)
+
+    # Restart the coordinator (and one worker) while the workers may be ahead.
+    fault_cluster["coord_svc"].hard_kill()
+    fault_cluster["w2"].hard_kill()
+    time.sleep(0.3)
+    fault_cluster["coord_svc"].start()
+    fault_cluster["w2"].start()
+    st = httpx.get(base + "/api/status", timeout=10).json()
+    assert st["status"] == "paused"
+    assert st["confirmed_round"] == confirmed
+    assert [p["round"] for p in st["loss_history"]] == list(
+        range(confirmed + 1))
+
+    # Resume twice: a duplicate request must never create a second loop.
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+    r = httpx.post(base + "/api/resume", timeout=20)
+    assert r.status_code in (200, 409)
+    final = _wait_status(base, lambda d: d["status"] == "completed",
+                         timeout=90)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    assert [p["round"] for p in final["loss_history"]] == list(
+        range(rounds + 1))
+    for k, point in enumerate(final["loss_history"]):
+        assert point["loss"] == ref["loss"][k]
+    np.testing.assert_array_equal(np.asarray(final["w"]),
+                                  np.asarray(ref["weights"][-1]))
+    # A completed group cannot be resumed into extra rounds.
+    assert httpx.post(base + "/api/resume", timeout=10).status_code == 409
+
+
+def test_completed_group_recovers_after_crash_before_completion_mark(
+        cluster, tmp_path):
+    """Crash after the last round was confirmed but before the 'completed'
+    status landed must not leave an unresumable paused group."""
+    base = cluster["coord"]
+    cdir = cluster["paths"]["coord"]
+    rounds = 5
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.05}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=rounds)
+    _wait_status(base, lambda d: d["status"] == "completed", timeout=60)
+    # Simulate the crash window: all rounds confirmed, status still 'running'.
+    doc = json.loads((cdir / "status.json").read_text())
+    doc["status"] = "running"
+    (cdir / "status.json").write_text(json.dumps(doc))
+    cluster["coord_svc"].hard_kill()
+    cluster["coord_svc"].start()
+    st = httpx.get(base + "/api/status", timeout=10).json()
+    assert st["status"] == "completed"
+    assert st["confirmed_round"] == rounds
+    _assert_confirmed_view(base, cdir, rounds, rounds)
+
+
+def test_startup_repairs_status_ahead_of_confirmed_invariants(
+        cluster, tmp_path):
+    """A status file carrying loss entries beyond confirmed_round (as the old
+    buggy build could persist) is repaired on startup so the web/loss/download
+    cannot show an unconfirmed round."""
+    base = cluster["coord"]
+    cdir = cluster["paths"]["coord"]
+    rounds = 4
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.05}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=rounds)
+    _wait_status(base, lambda d: d["confirmed_round"] >= 2)
+    st = _pause_now(base)
+    confirmed = st["confirmed_round"]
+    doc = json.loads((cdir / "status.json").read_text())
+    # Inject an unconfirmed trailing loss point, mimicking the old defect.
+    doc["loss_history"].append(
+        {"round": confirmed + 1, "loss": 0.123, "at": 0})
+    (cdir / "status.json").write_text(json.dumps(doc))
+    cluster["coord_svc"].hard_kill()
+    cluster["coord_svc"].start()
+    st = _assert_confirmed_view(base, cdir, confirmed, rounds)
+    assert st["status"] == "paused"
+
+
+def test_weight_export_failure_never_advances_download(
+        fault_cluster, tmp_path):
+    """If publishing the weight file fails after confirmation, the download
+    must still correspond to the confirmed round (rebuilt from status.json)."""
+    base = fault_cluster["coord"]
+    cdir = fault_cluster["paths"]["coord"]
+    rounds = 10
+    httpx.post(base + "/api/workers/delay", json={"seconds": 0.05}, timeout=5)
+    _create_and_start(base, _dataset_csv(tmp_path), rounds=rounds)
+    _wait_status(base, lambda d: d["confirmed_round"] >= 2)
+    st = _pause_now(base)
+    before = st["confirmed_round"]
+    # Fail the next immutable per-round weight export (status commit succeeds).
+    _arm_fault(fault_cluster["marker"], "weights_round_")
+
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+    st = _wait_status(base, lambda d: d["confirmed_round"] >= before + 1,
+                      timeout=40)
+    assert not fault_cluster["marker"].exists(), "export fault never fired"
+    st = _pause_now(base)
+    confirmed = st["confirmed_round"]
+    # Download is never ahead of, and always equals, the confirmed round.
+    wdoc = httpx.get(base + "/api/weights", timeout=10).json()
+    assert wdoc["confirmed_round"] == confirmed
+    assert wdoc["weights"]["w1"] == st["w"][1]
+    # The rebuilt file now exists for the confirmed round.
+    assert (cdir / "weights" /
+            f"weights_round_{confirmed:04d}.json").exists()
+    # The regenerated latest pointer matches the confirmed round too.
+    latest = json.loads((cdir / "weights" / "weights_latest.json").read_text())
+    assert latest["confirmed_round"] == confirmed
+
+    httpx.post(base + "/api/resume", timeout=20).raise_for_status()
+    final = _wait_status(base, lambda d: d["status"] == "completed",
+                         timeout=90)
+    _assert_confirmed_view(base, cdir, rounds, rounds)
+    ref = httpx.get(base + "/api/reference", timeout=10).json()
+    for k, point in enumerate(final["loss_history"]):
         assert point["loss"] == ref["loss"][k]

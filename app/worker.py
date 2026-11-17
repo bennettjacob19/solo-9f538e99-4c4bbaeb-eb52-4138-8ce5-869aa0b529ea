@@ -61,13 +61,18 @@ class WorkerState:
     # ------------------------------------------------------------------ duraload
     def _load_durable(self) -> None:
         shard = if_exists_read_json(SHARD_PATH)
+        state = if_exists_read_json(STATE_PATH)
         if shard:
             self.task_id = shard["task_id"]
             self._install_shard(shard["rows"])
-        state = if_exists_read_json(STATE_PATH)
-        if state:
-            # A persisted state always belongs to the shard's task.
-            self.task_id = state["task_id"]
+            if state and state.get("task_id") == shard["task_id"]:
+                self.round = int(state["round"])
+                self.w = np.asarray(state["w"], dtype=np.float64)
+                self.v = np.asarray(state["v"], dtype=np.float64)
+        elif state:
+            # State without its shard cannot serve any round traffic; keep it
+            # aside but stay task-neutral until the coordinator reloads us.
+            self.task_id = state.get("task_id")
             self.round = int(state["round"])
             self.w = np.asarray(state["w"], dtype=np.float64)
             self.v = np.asarray(state["v"], dtype=np.float64)
@@ -100,48 +105,57 @@ class WorkerState:
         if worker_id != WORKER_ID:
             raise HTTPException(status_code=400,
                                 detail=f"this worker is {WORKER_ID}")
-        # New task (or re-creation): wipe all previous durable state.
-        self.task_id = task_id
-        self._install_shard(rows)
-        self.round = 0
-        self.w = lrmath.zero_buffers()
-        self.v = lrmath.zero_buffers()
-        self.gen = None
+        # Prepare new-task buffers off to the side; publish them in memory only
+        # after both durable files landed. A failed write therefore leaves the
+        # worker reporting its previous (still disk-backed) task, so the
+        # coordinator's resume reloads the shard instead of training on state
+        # that would vanish on restart.
+        xs = np.asarray([r["x"] for r in rows], dtype=np.float64)
+        x_aug = lrmath.augment(xs)
+        y = np.asarray([r["y"] for r in rows], dtype=np.float64)
+        zero = lrmath.to_list(lrmath.zero_buffers())
         atomic_write_json(SHARD_PATH, {
             "task_id": task_id, "worker_id": WORKER_ID,
             "rows": rows, "n": len(rows),
         })
         atomic_write_json(STATE_PATH, {
             "task_id": task_id, "gen": None, "round": 0,
-            "w": lrmath.to_list(self.w), "v": lrmath.to_list(self.v),
+            "w": zero, "v": zero,
         })
+        self.task_id = task_id
+        self.x_aug = x_aug
+        self.y = y
+        self.round = 0
+        self.w = lrmath.zero_buffers()
+        self.v = lrmath.zero_buffers()
+        self.gen = None
 
     def prepare(self, task_id: str, gen: int, round_: int,
                 w: list, v: list) -> Dict[str, Any]:
         if self.task_id != task_id:
             raise HTTPException(status_code=410, detail="task id mismatch")
+        if self.x_aug is None:
+            raise HTTPException(status_code=410, detail="worker holds no shard")
         w_arr = np.asarray(w, dtype=np.float64)
         v_arr = np.asarray(v, dtype=np.float64)
-        # Install the new fencing generation *before* touching state.
-        self.gen = int(gen)
-        # Align (roll back or catch up) to the coordinator's confirmed round.
-        changed = (round_ != self.round
-                   or not np.array_equal(w_arr, self.w)
-                   or not np.array_equal(v_arr, self.v))
-        if changed:
-            self.round = int(round_)
-            self.w = w_arr
-            self.v = v_arr
-        # Always persist: a new generation must be durable even when the
-        # confirmed round and buffers themselves did not change.
+        # Align (roll back or catch up) to the coordinator's confirmed round,
+        # always persisting the new generation. Write first, publish in memory
+        # second: a failed durable write leaves the old generation fully
+        # intact, so the worker can never answer in a generation that is not
+        # backed by disk.
+        target_round = int(round_)
         atomic_write_json(STATE_PATH, {
             "task_id": task_id, "gen": int(gen),
-            "round": self.round,
-            "w": lrmath.to_list(self.w),
-            "v": lrmath.to_list(self.v),
+            "round": target_round,
+            "w": lrmath.to_list(w_arr), "v": lrmath.to_list(v_arr),
         })
-        return {"worker_id": WORKER_ID, "gen": self.gen,
-                "round": self.round, "durable_round": self.round}
+        self.gen = int(gen)
+        self.round = target_round
+        self.w = w_arr
+        self.v = v_arr
+        return {"worker_id": WORKER_ID, "task_id": task_id, "gen": self.gen,
+                "round": self.round, "durable_round": self.round,
+                "n": int(self.x_aug.shape[0])}
 
     def gradient(self, task_id: str, gen: int,
                  round_: int) -> Dict[str, Any]:
@@ -235,6 +249,7 @@ async def health() -> Dict[str, Any]:
         "worker_id": WORKER_ID, "alive": True,
         "task_id": STATE.task_id, "gen": STATE.gen,
         "round": STATE.round, "durable_round": STATE.round,
+        "n": (int(STATE.x_aug.shape[0]) if STATE.x_aug is not None else 0),
         "delay_seconds": STATE.delay_seconds,
         "uptime": round(time.time() - STATE.started_at, 3),
         "pid": os.getpid(),
@@ -245,7 +260,7 @@ async def health() -> Dict[str, Any]:
 async def load(body: LoadIn) -> Dict[str, Any]:
     STATE.load_task(body.task_id, body.worker_id, body.rows)
     return {"worker_id": WORKER_ID, "task_id": STATE.task_id,
-            "n": STATE.x_aug.shape[0], "round": STATE.round}
+            "n": int(STATE.x_aug.shape[0]), "round": STATE.round}
 
 
 @app.post("/prepare")

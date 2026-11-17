@@ -121,6 +121,7 @@
         <div class="k">任务状态</div><div><span class="pill idle" id="st">—</span></div>
         <div class="k">训练代 generation</div><div id="gen">—</div>
         <div class="k">已确认轮次</div><div id="confirmed">—</div>
+        <div class="k">可下载权重轮次</div><div id="dlround">—</div>
         <div class="k">最新损失（全数据 BCE）</div><div id="loss">—</div>
         <div class="k">进行中轮次</div><div id="running">—</div>
         <div class="k">最近事件</div><div id="event">—</div>
@@ -242,6 +243,9 @@ function render(d) {
   $("gen").textContent = d.gen ?? "—";
   $("confirmed").textContent =
     `${d.confirmed_round ?? "—"} / ${d.total_rounds ?? "—"}`;
+  // The download always equals the confirmed round; never show anything else.
+  $("dlround").textContent = d.confirmed_round != null
+    ? `round ${d.confirmed_round}` : "—";
   const last = (d.loss_history||[]).slice(-1)[0];
   $("loss").textContent = last ? fmt(last.loss) : "—";
   $("running").textContent = d.running_round ?? "—";

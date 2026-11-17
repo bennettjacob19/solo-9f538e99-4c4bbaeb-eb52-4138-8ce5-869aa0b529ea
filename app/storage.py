@@ -19,6 +19,51 @@ import os
 import tempfile
 from typing import Any
 
+# Optional fault-injection hook used by the write-failure tests. It is inert
+# unless STORAGE_FAULT_FILE points at a JSON marker file, e.g.
+#   {"match": "status.json", "contains": "\"confirmed_round\":5", "count": 1}
+# The next ``skip`` writes whose basename contains ``match`` succeed; the
+# following ``count`` matching writes raise OSError *before* touching the
+# filesystem, exactly like a failing disk. ``contains`` optionally restricts
+# the fault to payloads with a given substring, which lets a test target the
+# exact confirmation write rather than the numerous progress writes. Only the
+# test harness writes this marker; the training code never creates it.
+FAULT_FILE_ENV = "STORAGE_FAULT_FILE"
+
+
+def _consume_fault(path: str, text: str) -> None:
+    marker = os.environ.get(FAULT_FILE_ENV)
+    if not marker or not os.path.exists(marker):
+        return
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+    except (OSError, ValueError):
+        return
+    match = str(spec.get("match", ""))
+    if match and match not in os.path.basename(path):
+        return
+    contains = spec.get("contains")
+    if contains and str(contains) not in text:
+        return
+    skip = int(spec.get("skip", 0))
+    if skip > 0:
+        spec["skip"] = skip - 1
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump(spec, f)
+        return
+    count = int(spec.get("count", 1))
+    if count <= 1:
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            pass
+    else:
+        spec["count"] = count - 1
+        with open(marker, "w", encoding="utf-8") as f:
+            json.dump(spec, f)
+    raise OSError(f"injected durable-write failure for {path}")
+
 
 def _fsync_dir(path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
@@ -29,6 +74,7 @@ def _fsync_dir(path: str) -> None:
 
 
 def atomic_write_text(path: str, text: str) -> None:
+    _consume_fault(path, text)
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
